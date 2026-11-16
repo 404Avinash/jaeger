@@ -211,20 +211,14 @@ func TestBuildFieldComparison(t *testing.T) {
 	}
 }
 
-// TestBuildFieldComparison_UnmappedLevelIsAFieldRefusal pins that a built-in field of a level
-// with no mapped fields is refused as an unsupported field: the level itself is indexed and
-// declared, so a message saying otherwise would be false.
-func TestBuildFieldComparison_UnmappedLevelIsAFieldRefusal(t *testing.T) {
-	q := newNestedSQLBuilder()
-	_, err := q.buildFieldComparison(0, nil, expression.OpEq, *fieldRef(expression.LevelEvent, expression.EventFieldName), str("x"))
-	require.ErrorIs(t, err, tracestore.ErrFilterUnsupported)
-	assert.ErrorContains(t, err, `does not support the built-in field "name" of the "event" level`)
-}
-
+// TestBuildFieldComparison_UnsupportedField pins that a built-in field without a column is
+// refused as an unsupported field: its level is indexed and declared, so a message that
+// blames the level would be false.
 func TestBuildFieldComparison_UnsupportedField(t *testing.T) {
 	q := newNestedSQLBuilder()
-	_, err := q.buildFieldComparison(0, nil, expression.OpEq, *fieldRef(expression.LevelSpan, expression.SpanFieldTraceID), str("x"))
+	_, err := q.buildFieldComparison(0, nil, expression.OpEq, *fieldRef(expression.LevelScope, expression.ScopeFieldSchemaURL), str("x"))
 	require.ErrorIs(t, err, tracestore.ErrFilterUnsupported)
+	assert.ErrorContains(t, err, `does not support the built-in field "schemaURL" of the "scope" level`)
 }
 
 func TestBuildFieldComparison_WrongConstantType(t *testing.T) {
@@ -234,8 +228,13 @@ func TestBuildFieldComparison_WrongConstantType(t *testing.T) {
 	require.ErrorIs(t, err, tracestore.ErrFilterUnsupported)
 }
 
-func TestBuildFieldComparison_UnsupportedFieldType(t *testing.T) {
+func TestBuildFieldComparison_WrongConstantTypeForTimestamp(t *testing.T) {
 	_, err := builtinFieldValue(expression.FieldTypeTimestamp, str("2026-01-01T00:00:00Z"))
+	require.ErrorIs(t, err, tracestore.ErrFilterUnsupported)
+}
+
+func TestBuildFieldComparison_UnsupportedFieldType(t *testing.T) {
+	_, err := builtinFieldValue("no-such-type", str("2026-01-01T00:00:00Z"))
 	require.ErrorIs(t, err, tracestore.ErrFilterUnsupported)
 }
 
@@ -261,11 +260,10 @@ func TestBuildFieldComparison_OrdersDuration(t *testing.T) {
 	}
 }
 
-// TestBuildFieldComparison_OrderingReachesDurationOnly pins that the ordered comparisons the
-// capability declaration admits are lowered for span.duration alone: the other mapped fields hold
-// words or names and are refused rather than compared as text.
-func TestBuildFieldComparison_OrderingReachesDurationOnly(t *testing.T) {
-	for _, name := range []string{expression.SpanFieldName, expression.SpanFieldKind, expression.SpanFieldStatus} {
+// TestBuildFieldComparison_RefusesOrderingAWord pins that the ordered comparisons are refused
+// for the two fields that hold words, which have no order, rather than compared as text.
+func TestBuildFieldComparison_RefusesOrderingAWord(t *testing.T) {
+	for _, name := range []string{expression.SpanFieldKind, expression.SpanFieldStatus} {
 		t.Run(name, func(t *testing.T) {
 			q := newNestedSQLBuilder()
 			_, err := q.buildFieldComparison(0, nil, expression.OpGt, *fieldRef(expression.LevelSpan, name), str("m"))
@@ -1006,10 +1004,7 @@ func TestBuildFilterCondition_ExistsNeAndMembership(t *testing.T) {
 			for _, filterCase := range filters {
 				// The test driver returns its metadata rows once, so each filter has a reader.
 				reader := newStatusCodeMetadataReader(tt.layout)
-				q := reader.newSQLBuilder()
-				args, err := lowerFilter(t, reader, q, filterCase.filter)
-				require.NoError(t, err, filterCase.label)
-				fmt.Fprintf(&snapshot, "\n-- %s\n-- binds %v%s", filterCase.label, args, q.String())
+				appendFilterSnapshot(t, &snapshot, reader, filterCase.label, filterCase.filter)
 			}
 			clickhousetest.VerifyQuerySnapshot(t, snapshot.String())
 		})
@@ -1040,7 +1035,7 @@ func TestBuildFilterCondition_ExistsNeAndMembership_Refusals(t *testing.T) {
 		},
 		{
 			name:   "exists on a field without a column mapping",
-			filter: call(expression.OpExists, fieldRef(expression.LevelEvent, expression.EventFieldName)),
+			filter: call(expression.OpExists, fieldRef(expression.LevelScope, expression.ScopeFieldSchemaURL)),
 			err:    tracestore.ErrFilterUnsupported,
 		},
 		{
@@ -1095,7 +1090,7 @@ func TestBuildFilterCondition_ExistsNeAndMembership_Refusals(t *testing.T) {
 		},
 		{
 			name:   "not_in on a field without a column mapping",
-			filter: call(expression.OpNotIn, fieldRef(expression.LevelEvent, expression.EventFieldName), list("", "v")),
+			filter: call(expression.OpNotIn, fieldRef(expression.LevelResource, expression.ResourceFieldSchemaURL), list("", "v")),
 			err:    tracestore.ErrFilterUnsupported,
 		},
 		{
@@ -1131,4 +1126,136 @@ func TestCollectUntypedAttributeKeys_Membership(t *testing.T) {
 		p.Span().Attr("ne-typed").Ne(p.String("v")),
 	), keys)
 	assert.Equal(t, map[string]any{"in-untyped": ""}, keys.AsRaw())
+}
+
+// TestBuildFilterCondition_BuiltinFields snapshots the condition that each filter below
+// lowers to, after the values that it binds. A built-in field has the same column in every
+// attribute layout, so one layout is enough.
+func TestBuildFilterCondition_BuiltinFields(t *testing.T) {
+	instant := time.Date(2026, 1, 2, 3, 4, 5, 6, time.UTC)
+	filters := []struct {
+		label  string
+		filter *expression.Call
+	}{
+		{
+			label:  "eq on the trace ID",
+			filter: p.Span().TraceID.Eq("00000000000000000000000000000f01"),
+		},
+		{
+			label:  "eq on the span ID",
+			filter: p.Span().SpanID.Eq("0000000000000f01"),
+		},
+		{
+			label:  "exists on the parent span ID, which a root span lacks",
+			filter: p.Span().ParentSpanID.Exists(),
+		},
+		{
+			label:  "eq on the trace state",
+			filter: p.Span().TraceState.Eq("congo=t61rcWkgMzE"),
+		},
+		{
+			label:  "ne on the status message, which a span can lack",
+			filter: p.Span().StatusMessage.Ne("timeout"),
+		},
+		{
+			label:  "lt on the status message, which a span can lack",
+			filter: p.Span().StatusMessage.Lt("timeout"),
+		},
+		{
+			label:  "gt on the span name orders text",
+			filter: p.Span().Name.Gt("m"),
+		},
+		{
+			label:  "gt on the start time",
+			filter: p.Span().StartTime.Gt(instant),
+		},
+		{
+			label:  "lte on the end time, which is computed",
+			filter: p.Span().EndTime.Lte(instant),
+		},
+		{
+			label:  "in on the start time",
+			filter: p.Span().StartTime.In(instant, instant.Add(time.Second)),
+		},
+		{
+			label:  "eq on the scope name",
+			filter: p.Scope().Name.Eq("worker-scope"),
+		},
+		{
+			label:  "not_in on the scope version, which a span can lack",
+			filter: p.Scope().Version.NotIn("1.0", "2.0"),
+		},
+		{
+			label:  "eq on the name of an event",
+			filter: p.Event().Name.Eq("exception"),
+		},
+		{
+			label:  "ne on the name of an event",
+			filter: p.Event().Name.Ne("exception"),
+		},
+		{
+			label:  "exists on the name of an event",
+			filter: p.Event().Name.Exists(),
+		},
+		{
+			label:  "in on the name of an event",
+			filter: p.Event().Name.In("exception", "retry"),
+		},
+		{
+			label:  "not_in on the name of an event",
+			filter: p.Event().Name.NotIn("exception", "retry"),
+		},
+		{
+			label:  "gt on the time of an event",
+			filter: p.Event().Time.Gt(instant),
+		},
+		{
+			label:  "gt on the time of an event since the start of its span, which is computed",
+			filter: p.Event().TimeSinceStart.Gt(50 * time.Microsecond),
+		},
+		{
+			label:  "eq on the trace ID of a link",
+			filter: p.Link().TraceID.Eq("00000000000000000000000000000f01"),
+		},
+		{
+			label:  "eq on the span ID of a link",
+			filter: p.Link().SpanID.Eq("0000000000000f01"),
+		},
+		{
+			label:  "exists on the trace state of a link, which a link can lack",
+			filter: p.Link().TraceState.Exists(),
+		},
+		{
+			label:  "ne on the trace state of a link",
+			filter: p.Link().TraceState.Ne("congo=t61rcWkgMzE"),
+		},
+		{
+			label:  "lt on the trace state of a link",
+			filter: p.Link().TraceState.Lt("congo=u"),
+		},
+		{
+			label:  "in on the trace state of a link",
+			filter: p.Link().TraceState.In("congo=t61rcWkgMzE"),
+		},
+	}
+	reader := newTestReader()
+	var snapshot strings.Builder
+	for _, filterCase := range filters {
+		// The query boundary reads each constant as the type of its field before the reader
+		// sees the filter.
+		filter, err := tracestore.ResolveFilterConstants(filterCase.filter)
+		require.NoError(t, err, filterCase.label)
+		appendFilterSnapshot(t, &snapshot, reader, filterCase.label, filter)
+	}
+	clickhousetest.VerifyQuerySnapshot(t, snapshot.String())
+}
+
+// appendFilterSnapshot lowers filter and appends to snapshot its label, the values that it
+// binds and its condition.
+func appendFilterSnapshot(t *testing.T, snapshot *strings.Builder, reader *Reader, label string, filter *expression.Call) {
+	t.Helper()
+	q := reader.newSQLBuilder()
+	args, err := lowerFilter(t, reader, q, filter)
+	require.NoError(t, err, label)
+	fmt.Fprintf(snapshot, "\n-- %s\n-- binds %v%s", label, args, q.String())
 }
